@@ -77,13 +77,14 @@ python3.11 --version
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-source $HOME/.cargo/env
 ```
+
+**Note**: UV will be installed to `/opt/neuralhub/.local/bin/uv` (not `.cargo/bin`).
 
 Verify installation:
 
 ```bash
-uv --version
+/opt/neuralhub/.local/bin/uv --version
 ```
 
 #### Install PostgreSQL Client (for database migrations)
@@ -303,10 +304,10 @@ autorestart=true
 startretries=3
 stderr_logfile=/opt/neuralhub/logs/api-error.log
 stdout_logfile=/opt/neuralhub/logs/api-access.log
-environment=PATH="/opt/neuralhub/app/backend/.venv/bin:/opt/neuralhub/.cargo/bin"
+environment=PATH="/opt/neuralhub/app/backend/.venv/bin:/opt/neuralhub/.local/bin"
 ```
 
-**Note**: We include both the virtual environment bin and cargo bin (for uv) in the PATH.
+**Note**: We include both the virtual environment bin and local bin (for uv) in the PATH.
 
 ### 2. Create Supervisor Configuration for Worker
 
@@ -326,7 +327,7 @@ autorestart=true
 startretries=3
 stderr_logfile=/opt/neuralhub/logs/worker-error.log
 stdout_logfile=/opt/neuralhub/logs/worker-access.log
-environment=PATH="/opt/neuralhub/app/backend/.venv/bin:/opt/neuralhub/.cargo/bin"
+environment=PATH="/opt/neuralhub/app/backend/.venv/bin:/opt/neuralhub/.local/bin"
 ```
 
 **Note**: The worker uses the Python from the virtual environment to ensure consistency.
@@ -924,7 +925,7 @@ jobs:
             sudo -u neuralhub git reset --hard $COMMIT_HASH
             
             cd backend
-            sudo -u neuralhub /opt/neuralhub/.cargo/bin/uv sync --frozen
+            sudo -u neuralhub /opt/neuralhub/.local/bin/uv sync --frozen
             
             sudo supervisorctl restart neuralhub-api neuralhub-worker
             
