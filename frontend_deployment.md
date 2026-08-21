@@ -1,484 +1,502 @@
 # NeuralHub Frontend - Production Deployment Guide
 
-Complete guide for deploying the NeuralHub Next.js frontend on the same Ubuntu server as the backend, using Docker and CI/CD with GitHub Actions.
-
-This guide assumes:
-- The server is already set up per `backend_deployment.md` (Nginx, Supervisor, firewall, `neuralhub` user, `/opt/neuralhub/app` repo checkout already exist).
-- **Docker is already installed** on the server.
-- The frontend lives in a `frontend/` directory inside the same repository as the backend, with the `Dockerfile` shown below at its root.
+Complete guide for deploying the NeuralHub Frontend (Next.js) on the SAME Ubuntu Server as backend using Docker and CI/CD with GitHub Actions.
 
 ---
 
 ## Table of Contents
 
 1. [Prerequisites](#prerequisites)
-2. [How This Differs From the Backend](#how-this-differs-from-the-backend)
-3. [Application Setup](#application-setup)
-4. [CI/CD Pipeline Setup](#cicd-pipeline-setup)
-5. [Nginx & Domain Configuration](#nginx--domain-configuration)
-6. [Deployment Process](#deployment-process)
-7. [Monitoring & Maintenance](#monitoring--maintenance)
-8. [Troubleshooting](#troubleshooting)
-9. [Rollback Strategy](#rollback-strategy)
+2. [Server Setup](#server-setup)
+3. [Docker Installation](#docker-installation)
+4. [Application Setup](#application-setup)
+5. [Nginx Configuration](#nginx-configuration)
+6. [CI/CD Pipeline Setup](#cicd-pipeline-setup)
+7. [Deployment Process](#deployment-process)
+8. [Monitoring & Maintenance](#monitoring--maintenance)
+9. [Troubleshooting](#troubleshooting)
+10. [Rollback Strategy](#rollback-strategy)
 
 ---
 
 ## Prerequisites
 
-### Local Requirements
-- Git with SSH key configured for GitHub
-- Access to the same Ubuntu server used for the backend
+**IMPORTANT**: This guide assumes your backend is ALREADY deployed following `Backend_Deployment.md`. Your server should already have:
 
-### Server Requirements
-- Docker installed and running (`sudo docker --version` to confirm)
-- Same `/opt/neuralhub/app` repository checkout used by the backend (frontend code lives at `/opt/neuralhub/app/frontend`)
-- Nginx already installed (from backend setup)
-- Ports 80/443 open in the firewall (already done in backend setup)
+- ✅ `/opt/neuralhub/` directory structure
+- ✅ `neuralhub` user created
+- ✅ Repository cloned at `/opt/neuralhub/app`
+- ✅ Docker installed
+- ✅ Nginx installed
+- ✅ SSL certificates configured (optional)
 
-### Build-Time Environment Variables
-
-Your `Dockerfile` bakes these `NEXT_PUBLIC_*` values into the build at build time (Next.js requirement — they can't be injected at runtime like normal env vars):
-
-| Variable | Purpose |
-|---|---|
-| `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` | Clerk auth public key |
-| `NEXT_PUBLIC_API_BASE` | Base URL the browser calls for the API |
-| `NEXT_PUBLIC_API_URL` | Full API URL used client-side |
-| `NEXT_PUBLIC_WS_BASE` | WebSocket base URL |
-| `NEXT_PUBLIC_HUBROOM_URL` | Hubroom service URL |
-| `BACKEND_URL` | Server-side backend URL (used during SSR/build) |
-
-Because these are baked in at build time, **any change to these values requires rebuilding the image**, not just restarting the container.
+### Additional Requirements for Frontend
+- Docker and Docker Compose already installed on server
+- Domain name for frontend (can be same domain or subdomain)
+- Clerk publishable key for authentication
 
 ---
 
-## How This Differs From the Backend
+## Server Setup
 
-The backend uses Supervisor to run a Python process directly on the host. The frontend instead runs **inside a Docker container** built from the multi-stage `Dockerfile` (Node 22 Alpine, Next.js standalone output, non-root `nextjs` user, listening on port `3000`).
+### 1. Install Docker (if not already installed)
 
-Consequences:
-- No `venv`, no `uv`, no Supervisor config for the frontend — Docker handles the process lifecycle via `--restart unless-stopped`.
-- The container binds only to `127.0.0.1:3000` on the host; Nginx is the only thing exposed publicly, exactly like the backend on port `5003`.
-- Deployments rebuild the image and swap the container, rather than doing a `git pull` + in-place restart.
+SSH into your server:
+
+```bash
+ssh username@your-server-ip
+```
+
+Check if Docker is installed:
+
+```bash
+docker --version
+```
+
+If not installed, install Docker:
+
+```bash
+# Install Docker
+sudo apt update
+sudo apt install -y ca-certificates curl gnupg lsb-release
+sudo mkdir -p /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+
+# Add neuralhub user to docker group
+sudo usermod -aG docker neuralhub
+```
+
+### 2. Verify Directory Structure
+
+Your directory structure should already exist from backend setup:
+
+```bash
+ls -la /opt/neuralhub/app/
+# Should show: backend/, frontend/, .git/, etc.
+```
+
+If `/opt/neuralhub/logs/` doesn't exist, create it:
+
+```bash
+sudo mkdir -p /opt/neuralhub/logs
+sudo chown -R neuralhub:neuralhub /opt/neuralhub
+```
 
 ---
 
 ## Application Setup
 
-### 1. Confirm the Repository Layout
+**Note**: Your repository is already cloned at `/opt/neuralhub/app` from the backend setup. We'll just work with the frontend directory.
 
-The frontend code should already be present from the initial clone described in `backend_deployment.md`:
+### 1. Test Docker Build
+
+Switch to neuralhub user and test the build:
 
 ```bash
 sudo su - neuralhub
-cd /opt/neuralhub/app/frontend
-ls
-# Should show: Dockerfile, package.json, package-lock.json, app/ (or src/), public/, etc.
+cd ~/app/frontend
+
+# Test build with sample environment variables
+docker build \
+  --build-arg NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY="test-key" \
+  --build-arg NEXT_PUBLIC_API_BASE="http://localhost:5003" \
+  --build-arg NEXT_PUBLIC_API_URL="http://localhost:5003/api" \
+  --build-arg NEXT_PUBLIC_WS_BASE="ws://localhost:5003" \
+  --build-arg NEXT_PUBLIC_HUBROOM_URL="http://localhost:3000" \
+  --build-arg BACKEND_URL="http://localhost:5003" \
+  -t neuralhub-frontend:test .
+
+# If build succeeds, remove test image
+docker rmi neuralhub-frontend:test
+
+# Exit back to your sudo user
 exit
 ```
 
-If the frontend hasn't been pulled yet, a normal `git pull origin main` from `/opt/neuralhub/app` will bring it in alongside the backend.
-
-### 2. Verify Docker Access
-
-Since deployment runs `sudo docker ...` over SSH, confirm the deploying user (your `SERVER_USER`, **not** `neuralhub`) can run Docker commands:
-
-```bash
-docker --version
-sudo docker run hello-world
-```
-
-### 3. One-Time Manual Build (Sanity Check)
-
-Before wiring up CI/CD, do a manual build to confirm the `Dockerfile` and env vars are correct:
-
-```bash
-cd /opt/neuralhub/app/frontend
-
-sudo docker build \
-  --build-arg NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY="pk_live_xxx" \
-  --build-arg NEXT_PUBLIC_API_BASE="https://api.your-domain.com" \
-  --build-arg NEXT_PUBLIC_API_URL="https://api.your-domain.com" \
-  --build-arg NEXT_PUBLIC_WS_BASE="wss://api.your-domain.com" \
-  --build-arg NEXT_PUBLIC_HUBROOM_URL="https://hubroom.your-domain.com" \
-  --build-arg BACKEND_URL="http://127.0.0.1:5003" \
-  -t neuralhub-frontend:latest .
-
-sudo docker run -d --name neuralhub-frontend --restart unless-stopped \
-  -p 127.0.0.1:3000:3000 neuralhub-frontend:latest
-
-curl -f http://localhost:3000/
-```
-
-If `curl` returns HTML, the container is healthy. Stop here and clean up before moving to CI/CD if you were just testing:
-
-```bash
-sudo docker stop neuralhub-frontend && sudo docker rm neuralhub-frontend
-```
+If the build fails, check the Docker logs and fix any issues before proceeding.
 
 ---
 
-## CI/CD Pipeline Setup
+## Nginx Configuration
 
-### 1. Add the Workflow File
+Your setup:
+- **Frontend**: `https://neuralhub.us/` and `https://www.neuralhub.us/`
+- **Backend**: `https://agent.neuralhub.us/`
 
-Place the workflow at `.github/workflows/deploy-frontend.yml` in your repository (provided alongside this guide). It:
+### 1. Create Frontend Nginx Configuration
 
-- Triggers on pushes to `main` that touch `frontend/**`, or manually via `workflow_dispatch`
-- SSHes into the server, pulls the latest code
-- Builds a fresh Docker image with the `NEXT_PUBLIC_*` build args from GitHub Secrets
-- Tags the previous image as `neuralhub-frontend:previous` for rollback
-- Stops/removes the old container and starts a new one bound to `127.0.0.1:3000`
-- Runs a health check against `http://localhost:3000/`
-- Prunes dangling images to save disk space
-
-### 2. Setup GitHub Secrets
-
-Go to your repository → **Settings → Secrets and variables → Actions**, and add:
-
-**Shared with backend (already set if you followed `backend_deployment.md`):**
-- `SSH_PRIVATE_KEY`
-- `SERVER_IP`
-- `SERVER_USER`
-
-**Frontend-specific build args:**
-- `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`
-- `NEXT_PUBLIC_API_BASE`
-- `NEXT_PUBLIC_API_URL`
-- `NEXT_PUBLIC_WS_BASE`
-- `NEXT_PUBLIC_HUBROOM_URL`
-- `BACKEND_URL`
-
-### 3. Confirm Sudo Access for Docker
-
-Your `SERVER_USER` needs passwordless sudo for Docker (and `git`, if not already granted for backend deploys):
-
-```bash
-sudo visudo
-```
-
-Add (or extend the existing backend line):
-
-```
-your-username ALL=(ALL) NOPASSWD: /usr/bin/supervisorctl, /usr/bin/git, /usr/bin/docker
-```
-
-### 4. Test the Pipeline
-
-```bash
-git add .github/workflows/deploy-frontend.yml frontend_deployment.md
-git commit -m "Add frontend CI/CD deployment pipeline"
-git push origin main
-```
-
-Watch it run under your repository's **Actions** tab.
-
----
-
-## Nginx & Domain Configuration
-
-The frontend container listens only on `127.0.0.1:3000`. Nginx is what the public domain actually points to, exactly as with the backend on port `5003`.
-
-### 1. Create the Nginx Site Config
+Create a new Nginx config file for the frontend:
 
 ```bash
 sudo nano /etc/nginx/sites-available/neuralhub-frontend
 ```
+
+Add this configuration:
 
 ```nginx
 upstream neuralhub_frontend {
     server 127.0.0.1:3000;
 }
 
+# HTTP redirect to HTTPS
 server {
     listen 80;
-    server_name your-domain.com www.your-domain.com;  # Replace with your actual domain
+    server_name neuralhub.us www.neuralhub.us;
+    return 301 https://$host$request_uri;
+}
 
-    client_max_body_size 20M;
+# HTTPS Frontend
+server {
+    listen 443 ssl http2;
+    server_name neuralhub.us www.neuralhub.us;
 
+    # SSL Configuration (will be configured by Certbot)
+    # ssl_certificate /etc/letsencrypt/live/neuralhub.us/fullchain.pem;
+    # ssl_certificate_key /etc/letsencrypt/live/neuralhub.us/privkey.pem;
+
+    # Security Headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    client_max_body_size 100M;
+
+    # Logging
+    access_log /var/log/nginx/neuralhub-frontend-access.log;
+    error_log /var/log/nginx/neuralhub-frontend-error.log;
+
+    # Frontend - All routes
     location / {
         proxy_pass http://neuralhub_frontend;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-
-        # Required for Next.js hot-reload/websocket-based features
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-
+        proxy_cache_bypass $http_upgrade;
+        
+        # Timeouts
         proxy_connect_timeout 60s;
         proxy_send_timeout 60s;
         proxy_read_timeout 60s;
     }
 
-    # Next.js static assets — safe to cache aggressively
+    # Next.js static files - cache aggressively
     location /_next/static/ {
         proxy_pass http://neuralhub_frontend;
-        proxy_cache_valid 200 60m;
-        add_header Cache-Control "public, max-age=31536000, immutable";
+        expires 365d;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # Public assets
+    location /images/ {
+        proxy_pass http://neuralhub_frontend;
+        expires 30d;
+        add_header Cache-Control "public";
     }
 }
 ```
 
-> **If your API runs on a separate subdomain** (e.g. `api.your-domain.com` pointing at the backend's port `5003`), keep that as its own server block — reuse the one already defined in `backend_deployment.md`. This file only needs to handle the domain(s) that should serve the frontend.
-
-### 2. Enable the Site
+### 2. Enable Frontend Site
 
 ```bash
+# Enable the site
 sudo ln -s /etc/nginx/sites-available/neuralhub-frontend /etc/nginx/sites-enabled/
+
+# Test configuration
 sudo nginx -t
-sudo systemctl restart nginx
+
+# Reload Nginx
+sudo systemctl reload nginx
 ```
 
-### 3. Point Your Domain's DNS
+### 3. Setup SSL Certificate
 
-At your DNS provider, create an **A record** (and optionally an **AAAA** for IPv6):
-
-| Type | Name | Value |
-|---|---|---|
-| A | `@` (or `your-domain.com`) | Your server's public IP |
-| A | `www` | Your server's public IP |
-
-DNS propagation can take a few minutes to a few hours.
-
-### 4. Setup SSL with Let's Encrypt
-
-If Certbot isn't already installed from the backend setup:
+Get SSL certificate for the frontend domain:
 
 ```bash
-sudo apt install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d neuralhub.us -d www.neuralhub.us
 ```
 
-Issue and auto-configure the certificate:
+Certbot will automatically update the Nginx config with SSL settings.
+
+### 4. Verify Backend Configuration
+
+Your backend should already be configured at `agent.neuralhub.us`. Verify it exists:
 
 ```bash
-sudo certbot --nginx -d your-domain.com -d www.your-domain.com
+ls -la /etc/nginx/sites-enabled/ | grep neuralhub
 ```
 
-Certbot rewrites the site config to redirect HTTP → HTTPS and sets up auto-renewal (`systemctl status certbot.timer` to confirm).
-
-### 5. Verify
+If the backend Nginx config doesn't exist yet, create it:
 
 ```bash
-curl -I https://your-domain.com
+sudo nano /etc/nginx/sites-available/neuralhub-backend
 ```
 
-You should see a `200 OK` (or a Next.js redirect) served over HTTPS.
+Add:
 
----
+```nginx
+upstream neuralhub_backend {
+    server 127.0.0.1:5003;
+}
 
-## Deployment Process
+# HTTP redirect to HTTPS
+server {
+    listen 80;
+    server_name agent.neuralhub.us;
+    return 301 https://$host$request_uri;
+}
 
-### Automatic Deployment
+# HTTPS Backend
+server {
+    listen 443 ssl http2;
+    server_name agent.neuralhub.us;
 
-Every push to `main` touching `frontend/**` rebuilds the image and redeploys the container automatically.
+    # SSL Configuration (will be configured by Certbot)
+    # ssl_certificate /etc/letsencrypt/live/agent.neuralhub.us/fullchain.pem;
+    # ssl_certificate_key /etc/letsencrypt/live/agent.neuralhub.us/privkey.pem;
 
-### Manual Deployment
+    client_max_body_size 100M;
 
-1. Repository → **Actions**
-2. Select **"Deploy Frontend to Ubuntu Server"**
-3. **Run workflow** → choose branch → **Run workflow**
+    # Logging
+    access_log /var/log/nginx/neuralhub-backend-access.log;
+    error_log /var/log/nginx/neuralhub-backend-error.log;
 
-### Monitoring a Deployment
+    location / {
+        proxy_pass http://neuralhub_backend;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # WebSocket support
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        
+        # Timeouts
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
 
-```bash
-# Container logs
-sudo docker logs -f neuralhub-frontend
-
-# Container status
-sudo docker ps --filter "name=neuralhub-frontend"
-```
-
----
-
-## Monitoring & Maintenance
-
-### Container Management
-
-```bash
-# Status
-sudo docker ps -a --filter "name=neuralhub-frontend"
-
-# Restart
-sudo docker restart neuralhub-frontend
-
-# Stop / Start
-sudo docker stop neuralhub-frontend
-sudo docker start neuralhub-frontend
-
-# Live logs
-sudo docker logs -f --tail 200 neuralhub-frontend
-
-# Shell into the running container (debugging)
-sudo docker exec -it neuralhub-frontend sh
-```
-
-### Health Checks
-
-```bash
-curl http://localhost:3000/
-sudo docker inspect -f '{{.State.Health.Status}}' neuralhub-frontend 2>/dev/null || echo "no healthcheck defined"
-```
-
-### Disk Usage — Docker Images
-
-Old/dangling images accumulate over time. The CI workflow prunes dangling images automatically, but you can also check manually:
-
-```bash
-sudo docker images
-sudo docker system df
-sudo docker image prune -af --filter "until=168h"   # remove unused images older than 7 days
-```
-
-### Log Rotation
-
-Docker's default `json-file` logging driver can grow unbounded. Cap it globally:
-
-```bash
-sudo nano /etc/docker/daemon.json
-```
-
-```json
-{
-  "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "10m",
-    "max-file": "3"
-  }
+    # Health check
+    location /health {
+        proxy_pass http://neuralhub_backend/health;
+        access_log off;
+    }
 }
 ```
 
+Enable backend:
+
 ```bash
-sudo systemctl restart docker
+sudo ln -s /etc/nginx/sites-available/neuralhub-backend /etc/nginx/sites-enabled/
+sudo nginx -t
+sudo systemctl reload nginx
+sudo certbot --nginx -d agent.neuralhub.us
+```
+
+### 5. Final Verification
+
+Test both domains:
+
+```bash
+# Test frontend
+curl -I https://neuralhub.us/
+
+# Test backend
+curl -I https://agent.neuralhub.us/health
+```
+
+---
+
+## CI/CD Pipeline Setup
+
+### 1. GitHub Secrets Configuration
+
+The GitHub Actions workflow is already updated in `.github/workflows/deploy-frontend.yml`. You need to add these secrets to your GitHub repository:
+
+**Go to**: Repository → Settings → Secrets and variables → Actions
+
+**Add these NEW secrets** (in addition to the backend secrets you already have):
+
+| Secret Name | Value for neuralhub.us | Description |
+|-------------|------------------------|-------------|
+| `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` | `pk_live_xxxxx` | Your Clerk authentication key |
+| `NEXT_PUBLIC_API_BASE` | `https://agent.neuralhub.us` | Backend API base URL |
+| `NEXT_PUBLIC_API_URL` | `https://agent.neuralhub.us/api` | Full backend API URL |
+| `NEXT_PUBLIC_WS_BASE` | `wss://agent.neuralhub.us` | WebSocket base URL |
+| `NEXT_PUBLIC_HUBROOM_URL` | `https://neuralhub.us/hubroom` | HubRoom URL (if needed) |
+| `BACKEND_URL` | `https://agent.neuralhub.us` | Backend URL for server-side requests |
+
+**Note**: You should already have `SSH_PRIVATE_KEY`, `SERVER_IP`, and `SERVER_USER` from backend setup.
+
+### 2. Configure Server Permissions
+
+Your SSH user needs permission to run docker commands. Add this to sudoers:
+
+```bash
+sudo visudo
+```
+
+Update the line to include docker:
+
+```
+your-username ALL=(ALL) NOPASSWD: /usr/bin/supervisorctl, /usr/bin/git, /opt/neuralhub/.local/bin/uv, /usr/bin/docker
+```
+
+Or simply add your user to the docker group:
+
+```bash
+sudo usermod -aG docker your-username
+```
+
+### 3. Test Deployment
+
+The workflow `.github/workflows/deploy-frontend.yml` is already configured. Test it:
+
+```bash
+# On your local machine
+git add .
+git commit -m "Test frontend deployment"
+git push origin main
+```
+
+Check GitHub Actions tab to see the deployment running.
+
+---
+
+## Monitoring & Troubleshooting
+
+### Check Container Status
+
+```bash
+# View running containers
+sudo docker ps | grep neuralhub-frontend
+
+# View container logs
+sudo docker logs neuralhub-frontend --tail 100
+sudo docker logs -f neuralhub-frontend  # Follow logs
+
+# Restart container
+sudo docker restart neuralhub-frontend
+
+# Check resource usage
+sudo docker stats neuralhub-frontend --no-stream
+```
+
+### Common Issues
+
+**Container won't start:**
+```bash
+sudo docker logs neuralhub-frontend
+sudo lsof -i :3000  # Check if port is in use
+```
+
+**Nginx 502 Bad Gateway:**
+```bash
+sudo docker ps | grep neuralhub-frontend  # Check if running
+curl http://127.0.0.1:3000/  # Test directly
+sudo tail -f /var/log/nginx/error.log
+sudo systemctl reload nginx
+```
+
+**High memory usage:**
+```bash
+sudo docker stats neuralhub-frontend
 sudo docker restart neuralhub-frontend
 ```
 
----
-
-## Troubleshooting
-
-### Container Won't Start
-
+**Deployment failed:**
 ```bash
-sudo docker logs neuralhub-frontend
+# Check GitHub Actions logs first
+# Then on server:
+cd /opt/neuralhub/app
+sudo -u neuralhub git status
+sudo -u neuralhub git pull origin main
 ```
 
-Common causes: a missing/incorrect `NEXT_PUBLIC_*` build arg baked into a bad build, or port `3000` already in use.
-
-```bash
-sudo lsof -i :3000
-```
-
-### Build Fails on the Server
-
-SSH in and reproduce the build directly to see the full error:
-
-```bash
-cd /opt/neuralhub/app/frontend
-sudo docker build -t neuralhub-frontend:debug .
-```
-
-### 502 Bad Gateway from Nginx
-
-Usually means the container isn't running or isn't listening on `3000`:
-
-```bash
-sudo docker ps --filter "name=neuralhub-frontend"
-curl http://127.0.0.1:3000/
-sudo tail -f /var/log/nginx/error.log
-```
-
-### Old Content Still Showing After Deploy
-
-Check the browser isn't serving a cached version, and confirm the new image is actually running:
-
-```bash
-sudo docker inspect --format='{{.Created}}' neuralhub-frontend
-sudo docker images neuralhub-frontend
-```
-
-### SSL Certificate Issues
-
-```bash
-sudo certbot certificates
-sudo certbot renew --dry-run
-```
-
----
-
-## Rollback Strategy
-
-The deploy workflow tags the previous image as `neuralhub-frontend:previous` before building the new one, so rollback doesn't require a rebuild.
-
-### Manual Rollback (Fast — Reuse Previous Image)
+### Manual Deployment (if CI/CD fails)
 
 ```bash
 ssh username@your-server-ip
 
+cd /opt/neuralhub/app
+sudo -u neuralhub git pull origin main
+cd frontend
+
+# Build image
+sudo docker build \
+  --build-arg NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY="your-key" \
+  --build-arg NEXT_PUBLIC_API_BASE="https://yourdomain.com" \
+  --build-arg NEXT_PUBLIC_API_URL="https://yourdomain.com/api" \
+  --build-arg NEXT_PUBLIC_WS_BASE="wss://yourdomain.com" \
+  --build-arg NEXT_PUBLIC_HUBROOM_URL="https://yourdomain.com/hubroom" \
+  --build-arg BACKEND_URL="https://yourdomain.com" \
+  -t neuralhub-frontend:latest .
+
+# Stop old container
 sudo docker stop neuralhub-frontend
 sudo docker rm neuralhub-frontend
 
+# Start new container
 sudo docker run -d \
   --name neuralhub-frontend \
   --restart unless-stopped \
   -p 127.0.0.1:3000:3000 \
-  neuralhub-frontend:previous
+  neuralhub-frontend:latest
 
-curl -f http://localhost:3000/
+# Verify
+sudo docker ps | grep neuralhub-frontend
+curl http://localhost:3000/
 ```
-
-### Full Rollback (Rebuild From an Older Commit)
-
-```bash
-cd /opt/neuralhub/app
-sudo -u neuralhub git log --oneline -5
-sudo -u neuralhub git reset --hard COMMIT_HASH
-
-cd frontend
-sudo docker build \
-  --build-arg NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY="..." \
-  --build-arg NEXT_PUBLIC_API_BASE="..." \
-  --build-arg NEXT_PUBLIC_API_URL="..." \
-  --build-arg NEXT_PUBLIC_WS_BASE="..." \
-  --build-arg NEXT_PUBLIC_HUBROOM_URL="..." \
-  --build-arg BACKEND_URL="..." \
-  -t neuralhub-frontend:latest .
-
-sudo docker stop neuralhub-frontend && sudo docker rm neuralhub-frontend
-sudo docker run -d --name neuralhub-frontend --restart unless-stopped \
-  -p 127.0.0.1:3000:3000 neuralhub-frontend:latest
-```
-
-> **Note:** Because `main.reset --hard` rewrites the working tree shared with the backend checkout, coordinate frontend rollbacks with whoever manages backend deploys — resetting the repo affects both.
 
 ---
 
-## Summary Checklist
+## Summary
 
-### Initial Setup
-- [ ] Docker confirmed installed and working on the server
-- [ ] Frontend code present at `/opt/neuralhub/app/frontend`
-- [ ] Manual `docker build` + `docker run` sanity check passed
-- [ ] Nginx site config created and enabled
-- [ ] DNS A record(s) pointed at the server
-- [ ] SSL certificate issued via Certbot
+**What You Have Now:**
+1. ✅ Frontend containerized with Docker
+2. ✅ Nginx configured to serve frontend
+3. ✅ GitHub Actions CI/CD for automatic deployment
+4. ✅ Zero-downtime deployment with health checks
+5. ✅ Integrated with existing backend setup
 
-### CI/CD Setup
-- [ ] `.github/workflows/deploy-frontend.yml` added to the repo
-- [ ] All `NEXT_PUBLIC_*` and `BACKEND_URL` secrets set in GitHub
-- [ ] Passwordless sudo for `docker` confirmed for the deploy user
-- [ ] Pipeline tested end-to-end from a push to `main`
+**Directory Structure:**
+```
+/opt/neuralhub/app/
+├── backend/           # Backend (Supervisor-managed)
+└── frontend/          # Frontend (Docker-managed)
+```
 
-### Production Readiness
-- [ ] Health check passing at `https://your-domain.com`
-- [ ] Docker log rotation configured
-- [ ] Rollback tested at least once
-- [ ] Old/dangling images pruned automatically
+**Services:**
+- Backend API: `supervisorctl status neuralhub-api`
+- Backend Worker: `supervisorctl status neuralhub-worker`
+- Frontend: `docker ps | grep neuralhub-frontend`
+
+**Deployment Flow:**
+1. Push code to `main` branch (frontend/** changes)
+2. GitHub Actions triggers
+3. SSH into server
+4. Pull latest code
+5. Build Docker image
+6. Replace container
+7. Health check
+8. Done ✅
+
+**Need Help?**
+- Check logs: `sudo docker logs neuralhub-frontend`
+- Check Nginx: `sudo nginx -t && sudo systemctl status nginx`
+- Check backend: `sudo supervisorctl status`
 
 ---
 
-**Last Updated**: August 2026
-**Version**: 1.0
-**Maintained by**: NeuralHub Team
+**Last Updated**: January 2026
